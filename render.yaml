@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: LoadUpMediaBot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: "export DENO_INSTALL=\"$PWD/.deno\" && (test -x \"$DENO_INSTALL/bin/deno\" || curl -fsSL https://deno.land/install.sh | sh) && pip install -r requirements.txt"
+    startCommand: "export PATH=\"$PWD/.deno/bin:$PATH\" && python3 bot.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MAX_CONCURRENT_DOWNLOADS
+        value: "1"
