@@ -68,17 +68,32 @@
 #
 # На Render этот шаг подстраховывает deno из render.yaml: если deno по
 # какой-то причине не встал, node докачается автоматически при старте.
+#
+# ВАЖНО про Render: pip-слой кэшируется между деплоями. Если после добавления
+# nodeenv в requirements.txt в логе сборки его всё ещё нет, значит Render взял
+# закэшированный слой — нажмите Settings → Clear build cache & deploy.
 import os
+import shutil
 import subprocess
 import sys
+
+# Куда ставим deno, если nodeenv недоступен (только как резервный путь).
+_DENO_INSTALL_DIR = os.path.join(
+    os.environ.get("DENO_INSTALL", os.path.expanduser("~/.deno"))
+)
 
 # Принудительная установка Node.js внутрь виртуального окружения при старте
 try:
     node_path = os.path.join(sys.prefix, "bin", "node")
     if not os.path.exists(node_path):
-        print("Installing Node.js via nodeenv...")
-        subprocess.run([sys.executable, "-m", "nodeenv", "-p"], check=True)
-        print("Node.js successfully installed!")
+        print("Installing Node.js via nodeenv...", flush=True)
+        subprocess.run(
+            [sys.executable, "-m", "nodeenv", "-p"],
+            check=True,
+            capture_output=True,   # не засоряем лог шумом nodeenv
+            timeout=300,           # Free-тариф медленный, но не бесконечный
+        )
+        print("Node.js successfully installed!", flush=True)
     # Кладём папку с node в начало PATH, чтобы yt-dlp его гарантированно нашёл.
     node_bin_dir = os.path.join(sys.prefix, "bin")
     if os.path.isdir(node_bin_dir):
@@ -86,7 +101,39 @@ try:
         if node_bin_dir not in path_parts:
             os.environ["PATH"] = node_bin_dir + os.pathsep + os.environ.get("PATH", "")
 except Exception as e:
-    print(f"Failed to auto-install Node.js: {e}")
+    # Причина видна в логе: чаще всего "No module named nodeenv" — это значит,
+    # что pip не поставил пакет (обычно из-за кэша сборки Render) и нужен
+    # Clear build cache & deploy. Пробуем запасной путь — deno.
+    print(f"Failed to auto-install Node.js: {e}", flush=True)
+
+# --- Резервный путь: deno, если node так и не появился ---
+# deno самодостаточен (один бинарник) и yt-dlp умеет с ним работать.
+# Ставим только тогда, когда node нет — чтобы не тратить время на старте.
+deno_bin = os.path.join(_DENO_INSTALL_DIR, "bin", "deno")
+if not shutil.which("node") and not shutil.which("deno") and not os.path.exists(deno_bin):
+    try:
+        print("Installing Deno as JS runtime fallback...", flush=True)
+        subprocess.run(
+            [
+                "sh",
+                "-c",
+                f'export DENO_INSTALL="{_DENO_INSTALL_DIR}" && '
+                "curl -fsSL https://deno.land/install.sh | sh -s -- -y",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+        print("Deno successfully installed!", flush=True)
+    except Exception as e:
+        print(f"Failed to auto-install Deno: {e}", flush=True)
+
+# Добавляем папку deno в PATH, если бинарник появился.
+_deno_bin_dir = os.path.join(_DENO_INSTALL_DIR, "bin")
+if os.path.isdir(_deno_bin_dir):
+    _path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    if _deno_bin_dir not in _path_parts:
+        os.environ["PATH"] = _deno_bin_dir + os.pathsep + os.environ.get("PATH", "")
 
 
 # ============================================================
@@ -210,16 +257,28 @@ def _register_js_runtime_paths() -> Optional[str]:
     Возвращает путь к найденному рантайму (или None, если ничего не нашли).
     Это «пояс и подтяжки» поверх PATH из render.yaml.
     """
+    # 1) Сначала спрашиваем систему: вдруг deno/node уже есть в PATH
+    #    (например, /usr/bin/node на локальной машине). Это дешевле всего
+    #    и покрывает случаи, когда PATH настроен правильно.
+    for exe in ("deno", "node"):
+        found = shutil.which(exe)
+        if found:
+            return found
+
     project_dir = Path(__file__).resolve().parent
-    # Кандидаты: папка проекта (.deno/bin), домашняя ~/.deno/bin и «ручной» путь.
+    # 2) Затем — известные каталоги установки (Render, nodeenv, официальный
+    #    установщик deno). Кандидаты перечислены от самых вероятных.
     candidates = [
         # Куда ставит deno наш buildCommand: <project>/.deno/bin
         project_dir / ".deno" / "bin",
         # Куда ставит deno официальный установщик по умолчанию.
         Path.home() / ".deno" / "bin",
+        # Куда ставит nodeenv: в окружение Python рядом с интерпретатором.
+        Path(sys.prefix) / "bin",
         # Постоянный диск Render (на случай, если .deno выживает между
         # деплоями: DENO_INSTALL=/opt/render/.deno).
         Path("/opt/render/.deno/bin"),
+        Path("/opt/render/project/.deno/bin"),
         # Отдельно — путь, который Render иногда прописывает в env.
         Path(os.environ.get("DENO_INSTALL", "/nonexistent"), "bin"),
     ]
