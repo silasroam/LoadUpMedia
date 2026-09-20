@@ -1,3 +1,5 @@
 bot.log
 *.bak
 .deno/
+__pycache__/
+*.pyc

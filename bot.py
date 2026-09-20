@@ -51,6 +51,41 @@
 """
 
 # ============================================================
+#  АВТО-УСТАНОВКА NODE.JS ВНУТРЬ ОКРУЖЕНИЯ PYTHON
+# ============================================================
+# ВАЖНО: блок стоит ДО импорта yt_dlp/aiogram, чтобы node успел
+# появиться в PATH ещё до того, как yt-dlp начнёт искать JS-рантайм.
+#
+# Зачем: с 2025 года YouTube требует исполнить JavaScript, чтобы получить
+# «player response». Без JS-рантайма yt-dlp падает с ошибками
+# «Failed to extract any player response» / «nsig extraction failed».
+# nodeenv ставит Node.js прямо в окружение Python (sys.prefix), поэтому
+# бинарник лежит рядом с интерпретатором и не зависит от системных прав.
+#
+# На Render этот шаг подстраховывает deno из render.yaml: если deno по
+# какой-то причине не встал, node докачается автоматически при старте.
+import os
+import subprocess
+import sys
+
+# Принудительная установка Node.js внутрь виртуального окружения при старте
+try:
+    node_path = os.path.join(sys.prefix, "bin", "node")
+    if not os.path.exists(node_path):
+        print("Installing Node.js via nodeenv...")
+        subprocess.run([sys.executable, "-m", "nodeenv", "-p"], check=True)
+        print("Node.js successfully installed!")
+    # Кладём папку с node в начало PATH, чтобы yt-dlp его гарантированно нашёл.
+    node_bin_dir = os.path.join(sys.prefix, "bin")
+    if os.path.isdir(node_bin_dir):
+        path_parts = os.environ.get("PATH", "").split(os.pathsep)
+        if node_bin_dir not in path_parts:
+            os.environ["PATH"] = node_bin_dir + os.pathsep + os.environ.get("PATH", "")
+except Exception as e:
+    print(f"Failed to auto-install Node.js: {e}")
+
+
+# ============================================================
 #  СТАНДАРТНАЯ БИБЛИОТЕКА PYTHON
 # ============================================================
 import asyncio            # асинхронность: run_in_executor, таймауты, семафоры
