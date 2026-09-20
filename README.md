@@ -1,0 +1,89 @@
+# LoadUpMediaBot
+
+Telegram-бот для скачивания медиа: TikTok, Instagram Reels, YouTube Shorts, Pinterest.
+Стек: Python 3.10+, aiogram 3.x, yt-dlp (+ deno/node как JS-рантайм).
+
+## 🔒 Настройка токена (обязательно)
+
+Токен бота **не хранится в репозитории**. Он читается только из переменной
+окружения `BOT_TOKEN` (`bot.py`, блок «НАСТРОЙКИ»):
+
+```python
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+```
+
+Если переменная не задана, бот останавливается сразу с подсказкой.
+
+### На Render
+
+Dashboard → ваш сервис → **Environment** → **Add Environment Variable**:
+
+| Key | Value |
+|---|---|
+| `BOT_TOKEN` | ваш токен от @BotFather |
+| `MAX_CONCURRENT_DOWNLOADS` | `1` (для тарифа Free) |
+
+`render.yaml` уже содержит эти ключи; `BOT_TOKEN` помечен `sync: false`,
+поэтому его значение вводится только в UI и в git не попадает.
+
+### Локально
+
+```bash
+cp .env.example .env
+# впишите свой токен в .env
+export BOT_TOKEN="123456:ABC-ваш-токен"   # либо source .env
+python3 bot.py
+```
+
+`.env` добавлен в `.gitignore` и в репозиторий не попадёт.
+В репозитории лежит только `.env.example` с плейсхолдерами.
+
+## Запуск
+
+```bash
+pip install -r requirements.txt
+BOT_TOKEN="..." python3 bot.py
+```
+
+## Если токен всё-таки попал в git
+
+Попадание секрета в историю git нельзя «отменить» обычным коммитом:
+старые коммиты остаются доступны по прямой ссылке. Порядок действий:
+
+1. **Отозвать токен**: @BotFather → `/revoke` → выбрать бота → получить новый.
+   Старый токен после этого мёртв, даже если утёк.
+2. Записать новый токен **только** в переменные окружения (Render / `.env`).
+3. Вычистить секрет из истории репозитория (см. ниже).
+
+### Очистка истории
+
+`git-filter-repo` (рекомендуется):
+
+```bash
+pip install git-filter-repo
+git filter-repo --replace-text <(echo 'СТАРЫЙ_ТОКЕН==>REDACTED')
+git push --force origin main
+```
+
+Либо через `git filter-branch` (если filter-repo недоступен):
+
+```bash
+git filter-branch --tree-filter \
+  "grep -rl 'СТАРЫЙ_ТОКЕН' . 2>/dev/null | xargs -r sed -i 's|СТАРЫЙ_ТОКЕН|REDACTED|g'" \
+  -- --all
+git push --force origin main
+```
+
+После force-push секрета в истории не останется, но если репозиторий
+публичный и токен пролежал там какое-то время — **отзыв токена
+обязателен**, вычистка истории его не спасает.
+
+## Структура
+
+| Файл | Назначение |
+|---|---|
+| `bot.py` | Логика бота, точка входа, health-check сервер |
+| `texts.py` | Тексты сообщений (единая точка правки копирайта) |
+| `render.yaml` | Конфигурация сервиса Render (type: web, plan: free) |
+| `requirements.txt` | Python-зависимости |
+| `.env.example` | Шаблон секретов (безопасно коммитить) |
