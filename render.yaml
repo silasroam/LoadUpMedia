@@ -11,3 +11,14 @@ services:
         sync: false
       - key: MAX_CONCURRENT_DOWNLOADS
         value: "1"
+      # --- Cloudflare R2: для видео больше 50 МБ (лимит Telegram) ---
+      # sync: false означает, что значение вводится ТОЛЬКО в дашборде Render
+      # и никогда не хранится в репозитории.
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        value: "bot"

@@ -164,6 +164,11 @@ from aiohttp import web
 # Тексты сообщений бота — единая точка правки копирайта
 from texts import PROGRESS_FRAMES, msg
 
+# Загрузка больших видео в Cloudflare R2 (S3-совместимое хранилище).
+# Нужно потому, что Telegram Bot API не принимает от ботов файлы > 50 МБ:
+# такие видео мы отдаём пресайн-ссылкой. Ключи читаются только из окружения.
+import storage
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -776,18 +781,26 @@ async def handle_link(message: Message) -> None:
             size_bytes, _info = await probe_video_size(url)
             if size_bytes is not None and size_bytes > TELEGRAM_UPLOAD_LIMIT_BYTES:
                 size_mb = size_bytes / (1024 * 1024)
-                logger.info(
-                    "Отклонено: видео %.1f МБ > лимита %s МБ (%s)",
-                    size_mb, TELEGRAM_UPLOAD_LIMIT_MB, url,
-                )
-                await status.edit_text(
-                    msg(
-                        "ERROR_TOO_LARGE",
-                        size_mb=f"{size_mb:.1f}",
-                        limit_mb=TELEGRAM_UPLOAD_LIMIT_MB,
+                # Файл больше лимита Telegram. Если облако настроено — качаем
+                # и отдаём ссылкой (файлом всё равно нельзя). Если нет —
+                # честно отказываем, НЕ скачивая (экономим трафик и диск).
+                if not storage.is_configured():
+                    logger.info(
+                        "Отклонено: видео %.1f МБ > лимита %s МБ (%s)",
+                        size_mb, TELEGRAM_UPLOAD_LIMIT_MB, url,
                     )
+                    await status.edit_text(
+                        msg(
+                            "ERROR_TOO_LARGE",
+                            size_mb=f"{size_mb:.1f}",
+                            limit_mb=TELEGRAM_UPLOAD_LIMIT_MB,
+                        )
+                    )
+                    return  # ничего не скачивали — чистить нечего
+                logger.info(
+                    "Видео %.1f МБ > лимита %s МБ — пойдёт ссылкой в облако.",
+                    size_mb, TELEGRAM_UPLOAD_LIMIT_MB,
                 )
-                return  # ничего не скачивали — чистить нечего
 
             if size_bytes is None:
                 logger.info("Размер заранее неизвестен — проверю после скачивания.")
@@ -811,14 +824,54 @@ async def handle_link(message: Message) -> None:
             # --- ШАГ 3: ФАКТИЧЕСКАЯ ПРОВЕРКА РАЗМЕРА ПЕРЕД ОТПРАВКОЙ ---
             actual_mb = downloaded.stat().st_size / (1024 * 1024)
             if actual_mb > TELEGRAM_UPLOAD_LIMIT_MB:
-                logger.info("Отклонено после скачивания: %.1f МБ", actual_mb)
+                # Метаданные могли соврать — файл оказался больше лимита.
+                # Если облако доступно, отдаём ссылкой; иначе отказываем.
+                if not storage.is_configured():
+                    logger.info("Отклонено после скачивания: %.1f МБ", actual_mb)
+                    await status.edit_text(
+                        msg(
+                            "ERROR_TOO_LARGE",
+                            size_mb=f"{actual_mb:.1f}",
+                            limit_mb=TELEGRAM_UPLOAD_LIMIT_MB,
+                        )
+                    )
+                    return  # work_dir удалится в finally
+
+                logger.info(
+                    "После скачивания %.1f МБ > лимита — загружаю в облако.",
+                    actual_mb,
+                )
+                await status.edit_text(
+                    msg("STATUS_UPLOADING_CLOUD", frame=PROGRESS_FRAMES[0])
+                )
+                try:
+                    # upload_and_get_link синхронный (boto3) — уводим в поток,
+                    # чтобы не блокировать event loop бота на время загрузки.
+                    link = await asyncio.to_thread(
+                        storage.upload_and_get_link, downloaded
+                    )
+                except RuntimeError as exc:
+                    logger.error("Загрузка в облако не удалась: %s", exc)
+                    await status.edit_text(
+                        msg(
+                            "ERROR_CLOUD_UPLOAD",
+                            size_mb=f"{actual_mb:.1f}",
+                            limit_mb=TELEGRAM_UPLOAD_LIMIT_MB,
+                        )
+                    )
+                    return  # work_dir удалится в finally
+
                 await status.edit_text(
                     msg(
-                        "ERROR_TOO_LARGE",
+                        "SUCCESS_CLOUD_LINK",
                         size_mb=f"{actual_mb:.1f}",
                         limit_mb=TELEGRAM_UPLOAD_LIMIT_MB,
-                    )
+                        link=html.escape(link, quote=True),
+                        ttl_min=storage.R2_LINK_TTL_SECONDS // 60,
+                    ),
+                    disable_web_page_preview=True,
                 )
+                logger.info("Ссылка на облако отправлена пользователю %s", user.id)
                 return  # work_dir удалится в finally
 
             # --- ШАГ 4: ОТПРАВКА (файл стримится с диска, не из RAM) ---
@@ -922,6 +975,18 @@ async def main() -> None:
         logger.warning(
             "JS-рантайм (deno/node) не найден! YouTube-видео, скорее всего, "
             "не скачаются: установите deno (см. render.yaml) или node."
+        )
+
+    # Что делать с видео больше лимита Telegram: ссылкой в облако или отказ.
+    if storage.is_configured():
+        logger.info("Облако R2: %s (ссылки живут %d мин.)",
+                    storage.describe_config(), storage.R2_LINK_TTL_SECONDS // 60)
+    else:
+        logger.warning(
+            "Облако R2 не настроено: видео больше %s МБ будут отклоняться. "
+            "Задайте R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, "
+            "R2_BUCKET (см. .env.example) — тогда они будут отдаваться ссылкой.",
+            TELEGRAM_UPLOAD_LIMIT_MB,
         )
 
     # Экземпляр бота (aiogram 3): ParseMode.HTML по умолчанию

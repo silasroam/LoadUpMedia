@@ -3,4 +3,5 @@ aiohttp
 aiofiles
 yt-dlp
 nodeenv
+boto3
 
