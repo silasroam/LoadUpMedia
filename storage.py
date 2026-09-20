@@ -39,6 +39,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Tuple
 
 import boto3                      # S3-совместимый клиент (работает с R2)
 from botocore.config import Config
@@ -101,8 +102,11 @@ def describe_config() -> str:
     return f"R2 бакет '{R2_BUCKET}', endpoint '{R2_ENDPOINT}'"
 
 
-def upload_and_get_link(local_file_path: Path) -> str:
-    """Загружает файл в R2 и возвращает пресайн-ссылку для скачивания.
+def upload_and_get_link(local_file_path: Path) -> Tuple[str, str]:
+    """Загружает файл в R2. Возвращает (пресайн-ссылка, ключ объекта).
+
+    Ключ объекта нужен вызывающей стороне, чтобы потом удалить файл из
+    облака (у нас для этого есть фоновая задача).
 
     ВАЖНО: файл с диска здесь НЕ удаляется. Удалением занимается штатный
     `finally` в обработчике (он сносит всю временную папку запроса целиком),
@@ -147,7 +151,7 @@ def upload_and_get_link(local_file_path: Path) -> str:
     logger.info("Загрузка в R2 завершена: %s", object_key)
 
     try:
-        return client.generate_presigned_url(
+        link = client.generate_presigned_url(
             "get_object",
             Params={"Bucket": R2_BUCKET, "Key": object_key},
             ExpiresIn=R2_LINK_TTL_SECONDS,
@@ -157,6 +161,8 @@ def upload_and_get_link(local_file_path: Path) -> str:
             "Не удалось создать пресайн-ссылку: %s: %s", type(exc).__name__, exc
         )
         raise RuntimeError("Не удалось создать ссылку на видео.") from exc
+
+    return link, object_key
 
 
 def delete_object(object_key: str) -> bool:

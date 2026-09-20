@@ -4,7 +4,17 @@ services:
     env: python
     region: oregon
     plan: free
-    buildCommand: "export DENO_INSTALL=\"$PWD/.deno\" && (test -x \"$DENO_INSTALL/bin/deno\" || curl -fsSL https://deno.land/install.sh | sh) && pip install -r requirements.txt"
+    # ffmpeg ОБЯЗАТЕЛЕН: без него yt-dlp не склеит отдельные видео- и
+    # аудиодорожки, и ролики с YouTube придут БЕЗ ЗВУКА.
+    #
+    # ☝️ На Render ffmpeg УЖЕ ПРЕДУСТАНОВЛЕН в native Python-рантайме
+    # (docs: render.com/docs/native-runtimes), поэтому ставить его не нужно —
+    # apt-get/sudo в чужой системе только рисковали бы уронить билд.
+    # Мы лишь ПРОВЕРЯЕМ наличие и печатаем внятную ошибку, если его нет
+    # (например, при локальной сборке в Docker).
+    # deno ставим сами: его в рантайме нет, а без JS-рантайма YouTube не
+    # отдаёт player response.
+    buildCommand: "export DENO_INSTALL=\"$PWD/.deno\" && (test -x \"$DENO_INSTALL/bin/deno\" || curl -fsSL https://deno.land/install.sh | sh) && (command -v ffmpeg >/dev/null && ffmpeg -version | head -1 || echo 'PREPARE: ffmpeg не найден — YouTube-видео могут прийти без звука!') && pip install -r requirements.txt"
     startCommand: "export PATH=\"$PWD/.deno/bin:$PATH\" && python3 bot.py"
     envVars:
       - key: BOT_TOKEN
@@ -22,3 +32,13 @@ services:
         sync: false
       - key: R2_BUCKET
         value: "bot"
+      # Необязательные настройки облака (можно менять в дашборде).
+      # Потолок размера видео через облако: защита диска Render Free.
+      - key: CLOUD_MAX_DOWNLOAD_GB
+        value: "2"
+      # Таймаут залива в R2 — чтобы бот не завис навсегда при сбое облака.
+      - key: CLOUD_UPLOAD_TIMEOUT_SECONDS
+        value: "300"
+      # Через сколько секунд удалять файл из R2 после отправки ссылки.
+      - key: CLOUD_FILE_TTL_SECONDS
+        value: "600"
