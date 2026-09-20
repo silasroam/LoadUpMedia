@@ -21,24 +21,3 @@ services:
         sync: false
       - key: MAX_CONCURRENT_DOWNLOADS
         value: "1"
-      # --- Cloudflare R2: для видео больше 50 МБ (лимит Telegram) ---
-      # sync: false означает, что значение вводится ТОЛЬКО в дашборде Render
-      # и никогда не хранится в репозитории.
-      - key: R2_ACCOUNT_ID
-        sync: false
-      - key: R2_ACCESS_KEY_ID
-        sync: false
-      - key: R2_SECRET_ACCESS_KEY
-        sync: false
-      - key: R2_BUCKET
-        value: "bot"
-      # Необязательные настройки облака (можно менять в дашборде).
-      # Потолок размера видео через облако: защита диска Render Free.
-      - key: CLOUD_MAX_DOWNLOAD_GB
-        value: "2"
-      # Таймаут залива в R2 — чтобы бот не завис навсегда при сбое облака.
-      - key: CLOUD_UPLOAD_TIMEOUT_SECONDS
-        value: "300"
-      # Через сколько секунд удалять файл из R2 после отправки ссылки.
-      - key: CLOUD_FILE_TTL_SECONDS
-        value: "600"

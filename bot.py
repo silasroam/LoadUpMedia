@@ -164,11 +164,6 @@ from aiohttp import web
 # Тексты сообщений бота — единая точка правки копирайта
 from texts import PROGRESS_FRAMES, msg
 
-# Загрузка больших видео в Cloudflare R2 (S3-совместимое хранилище).
-# Нужно потому, что Telegram Bot API не принимает от ботов файлы > 50 МБ:
-# такие видео мы отдаём пресайн-ссылкой. Ключи читаются только из окружения.
-import storage
-
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -224,17 +219,6 @@ METADATA_TIMEOUT_SECONDS = 90
 
 # Таймаут на ОТПРАВКУ файла в Telegram, в секундах.
 UPLOAD_TIMEOUT_SECONDS = 600
-
-# Таймаут на ЗАЛИВ файла в облако (R2) и на его удаление, в секундах.
-# Без него «затупившее» облако подвесило бы бота навсегда: связь с R2 идёт
-# через синхронный boto3 в отдельном потоке, и без wait_for запрос просто
-# висел бы до перезапуска контейнера Render.
-CLOUD_UPLOAD_TIMEOUT_SECONDS = int(os.getenv("CLOUD_UPLOAD_TIMEOUT_SECONDS", "300"))
-
-# Через сколько секунд после успешной отправки ссылки удалять файл из R2.
-# 10 минут: пресайн-ссылка (по умолчанию 1 час) ещё жива, но при этом
-# хранилище не забивается. Переопределяется переменной окружения.
-CLOUD_FILE_TTL_SECONDS = int(os.getenv("CLOUD_FILE_TTL_SECONDS", "600"))
 
 # Лимит Telegram на загрузку файла ботом (~50 МБ на официальном Bot API).
 TELEGRAM_UPLOAD_LIMIT_MB = 50
@@ -366,41 +350,26 @@ def extract_url(text: str) -> Optional[str]:
 #  НАСТРОЙКИ И СКАЧИВАНИЕ ЧЕРЕЗ yt-dlp
 # ============================================================
 
-# Единая строка выбора формата: стараемся получить готовый mp4,
-# чтобы ffmpeg не перекодировал видео (перекодирование — это CPU и время).
-VIDEO_FORMAT_SELECTOR = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+# Единая строка выбора формата: берём ХУДШЕЕ/СРЕДНЕЕ качество, чтобы файл
+# гарантированно весил мало. Telegram Bot API не принимает от ботов файлы
+# больше 50 МБ, а на бесплатном Render мало и диска, и памяти, поэтому
+# «максимально сжатый мобильный файл» — осознанный компромисс:
+# лучше маленькое видео в чате, чем отказ.
+#
+# Как читается селектор (yt-dlp берёт первый подходящий вариант):
+#   1) worstvideo[ext=mp4]+worstaudio[ext=m4a] — худшие дорожки в mp4/m4a
+#      (ffmpeg просто склеит их, без перекодирования);
+#   2) worst[ext=mp4]  — цельный mp4 самого низкого качества;
+#   3) worst           — вообще самый лёгкий вариант, что найдётся.
+VIDEO_FORMAT_SELECTOR = "worstvideo[ext=mp4]+worstaudio[ext=m4a]/worst[ext=mp4]/worst"
 
 # Лимит в байтах — используется и в предпроверке, и как страховка в yt-dlp.
 TELEGRAM_UPLOAD_LIMIT_BYTES = TELEGRAM_UPLOAD_LIMIT_MB * 1024 * 1024
 
-# Максимальный размер скачиваемого файла, когда включено облако (R2).
-# Такие видео уходят пользователю ссылкой, поэтому лимит Telegram (50 МБ)
-# их НЕ ограничивает. 2 ГБ — компромисс: покрывает почти любое видео, но
-# защищает диск Render Free от файлов-гигантов.
-CLOUD_MAX_DOWNLOAD_BYTES = int(
-    float(os.getenv("CLOUD_MAX_DOWNLOAD_GB", "2")) * 1024 * 1024 * 1024
-)
-
-
-def download_size_limit() -> Optional[int]:
-    """Возвращает лимит размера для yt-dlp — или None, если лимита нет.
-
-    Логика:
-      * облако (R2) настроено → большие файлы допустимы (2 ГБ по умолчанию),
-        потому что они уйдут пользователю ссылкой, а не в чат;
-      * облака нет → лимит строго 50 МБ: файл всё равно не примет Telegram,
-        и нет смысла тратить трафик, диск и 10 минут времени.
-
-    Именно поэтому `max_filesize` в yt-dlp больше НЕ привязан жёстко к
-    лимиту Telegram: иначе yt-dlp обрывал бы скачивание на 50 МБ и ветка
-    «отдать ссылкой» никогда бы не сработала.
-    """
-    return CLOUD_MAX_DOWNLOAD_BYTES if storage.is_configured() else TELEGRAM_UPLOAD_LIMIT_BYTES
-
 
 def build_ydl_opts(
     output_path: Path,
-    max_filesize: Optional[int] = None,
+    max_filesize: int = TELEGRAM_UPLOAD_LIMIT_BYTES,
 ) -> Dict[str, Any]:
     """Собирает настройки yt-dlp для СКАЧИВАНИЯ одного видео.
 
@@ -412,12 +381,9 @@ def build_ydl_opts(
     где лежит готовый файл (yt-dlp сам подставляет своё расширение,
     если формат видео не совпал с нашим шаблоном).
 
-    Аргумент max_filesize задаёт потолок размера в байтах. По умолчанию
-    (None) берётся `download_size_limit()`: 2 ГБ при настроенном облаке,
-    иначе 50 МБ. None означает «лимита нет».
+    Аргумент max_filesize задаёт потолок размера в байтах: если файл
+    всё же превысит лимит Telegram, yt-dlp сам прервёт загрузку.
     """
-    if max_filesize is None:
-        max_filesize = download_size_limit()
     opts: Dict[str, Any] = {
         # Формат: лучшее видео mp4 + лучший звук m4a; иначе цельный mp4; иначе лучшее.
         "format": VIDEO_FORMAT_SELECTOR,
@@ -440,9 +406,8 @@ def build_ydl_opts(
 
         # --- ЗАЩИТА ОТ БОЛЬШИХ ФАЙЛОВ (вторая линия обороны) ---
         # Если по какой-то причине метаданные соврали и файл превысит лимит,
-        # yt-dlp сам прервёт скачивание, не забивая диск. Значение None
-        # означает «лимита нет» — в этом случае ключ просто не добавляем.
-        **({"max_filesize": max_filesize} if max_filesize else {}),
+        # yt-dlp сам прервёт скачивание, не забивая диск.
+        "max_filesize": max_filesize,
 
         # --- СЕТЕВЫЕ ТАЙМАУТЫ И ПОВТОРЫ ---
         "socket_timeout": 20,      # не зависать на «мёртвом» соединении
@@ -703,12 +668,8 @@ def friendly_error_text(exc: Exception, url: str) -> str:
     # Файл больше лимита Telegram — показываем отдельный понятный текст.
     if isinstance(exc, FileTooLargeError):
         if exc.size_mb is not None:
-            return msg(
-                "ERROR_TOO_LARGE",
-                size_mb=f"{exc.size_mb:.1f}",
-                limit_mb=TELEGRAM_UPLOAD_LIMIT_MB,
-            )
-        return msg("ERROR_TOO_LARGE_UNKNOWN", limit_mb=TELEGRAM_UPLOAD_LIMIT_MB)
+            return msg("ERROR_TOO_HEAVY", size_mb=f"{exc.size_mb:.1f}")
+        return msg("ERROR_TOO_HEAVY")
 
     # Наш собственный таймаут скачивания/отправки.
     if "превысило" in str(exc):
@@ -822,45 +783,16 @@ async def handle_link(message: Message) -> None:
             size_bytes, _info = await probe_video_size(url)
             if size_bytes is not None and size_bytes > TELEGRAM_UPLOAD_LIMIT_BYTES:
                 size_mb = size_bytes / (1024 * 1024)
-                # Файл больше лимита Telegram. Если облако настроено — качаем
-                # и отдаём ссылкой (файлом всё равно нельзя). Если нет —
-                # честно отказываем, НЕ скачивая (экономим трафик и диск).
-                if not storage.is_configured():
-                    logger.info(
-                        "Отклонено: видео %.1f МБ > лимита %s МБ (%s)",
-                        size_mb, TELEGRAM_UPLOAD_LIMIT_MB, url,
-                    )
-                    await status.edit_text(
-                        msg(
-                            "ERROR_TOO_LARGE",
-                            size_mb=f"{size_mb:.1f}",
-                            limit_mb=TELEGRAM_UPLOAD_LIMIT_MB,
-                        )
-                    )
-                    return  # ничего не скачивали — чистить нечего
-
-                # Облако есть, но и у него есть потолок (по умолчанию 2 ГБ):
-                # защищаем диск Render Free от файлов-гигантов. Отказываем
-                # тоже ДО скачивания, чтобы не тратить время и место.
-                if size_bytes > CLOUD_MAX_DOWNLOAD_BYTES:
-                    cloud_limit_gb = CLOUD_MAX_DOWNLOAD_BYTES / (1024 ** 3)
-                    logger.info(
-                        "Отклонено: видео %.1f МБ > потолка облака %.1f ГБ (%s)",
-                        size_mb, cloud_limit_gb, url,
-                    )
-                    await status.edit_text(
-                        msg(
-                            "ERROR_TOO_LARGE_CLOUD",
-                            size_mb=f"{size_mb:.1f}",
-                            cloud_limit_gb=f"{cloud_limit_gb:g}",
-                        )
-                    )
-                    return  # ничего не скачивали — чистить нечего
-
+                # Даже в САМОМ ХУДШЕМ качестве видео весит больше лимита
+                # Telegram — скачивать его бессмысленно: файл всё равно
+                # не пройдёт в чат. Отказываем сразу, не тратя ни трафик,
+                # ни диск, ни время сервера.
                 logger.info(
-                    "Видео %.1f МБ > лимита %s МБ — пойдёт ссылкой в облако.",
-                    size_mb, TELEGRAM_UPLOAD_LIMIT_MB,
+                    "Отклонено: видео %.1f МБ > лимита %s МБ (%s)",
+                    size_mb, TELEGRAM_UPLOAD_LIMIT_MB, url,
                 )
+                await status.edit_text(msg("ERROR_TOO_HEAVY", size_mb=f"{size_mb:.1f}"))
+                return  # ничего не скачивали — чистить нечего
 
             if size_bytes is None:
                 logger.info("Размер заранее неизвестен — проверю после скачивания.")
@@ -881,88 +813,19 @@ async def handle_link(message: Message) -> None:
                 downloaded.name, downloaded.stat().st_size / (1024 * 1024),
             )
 
-            # --- ШАГ 3: РЕШЕНИЕ — ФАЙЛОМ ИЛИ ССЫЛКОЙ? ---
-            # Здесь и только здесь известно, настроено ли облако, поэтому
-            # именно тут сравниваем размер с лимитом Telegram.
+            # --- ШАГ 3: ЖЁСТКАЯ ПРОВЕРКА РАЗМЕРА ---
+            # Метаданные могли соврать — проверяем РЕАЛЬНЫЙ размер на диске.
+            # Даже в худшем качестве файл обязан пройти в лимит Telegram,
+            # иначе отказываем.
             actual_mb = downloaded.stat().st_size / (1024 * 1024)
             if actual_mb > TELEGRAM_UPLOAD_LIMIT_MB:
-                # Метаданные могли соврать — файл оказался больше лимита.
-                # Если облако доступно, отдаём ссылкой; иначе отказываем.
-                if not storage.is_configured():
-                    logger.info("Отклонено после скачивания: %.1f МБ", actual_mb)
-                    await status.edit_text(
-                        msg(
-                            "ERROR_TOO_LARGE",
-                            size_mb=f"{actual_mb:.1f}",
-                            limit_mb=TELEGRAM_UPLOAD_LIMIT_MB,
-                        )
-                    )
-                    return  # work_dir удалится в finally
-
                 logger.info(
-                    "После скачивания %.1f МБ > лимита — загружаю в облако.",
-                    actual_mb,
+                    "Отклонено после скачивания: %.1f МБ > %s МБ",
+                    actual_mb, TELEGRAM_UPLOAD_LIMIT_MB,
                 )
                 await status.edit_text(
-                    msg("STATUS_UPLOADING_CLOUD", frame=PROGRESS_FRAMES[0])
+                    msg("ERROR_TOO_HEAVY", size_mb=f"{actual_mb:.1f}")
                 )
-                object_key: Optional[str] = None
-                try:
-                    # upload_and_get_link синхронный (boto3) — уводим в поток,
-                    # чтобы не блокировать event loop бота на время загрузки.
-                    # Оборачиваем в wait_for: если облако «тупит», бот не должен
-                    # висеть вечно — лучше честно сообщить об ошибке.
-                    link, object_key = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            storage.upload_and_get_link, downloaded
-                        ),
-                        timeout=CLOUD_UPLOAD_TIMEOUT_SECONDS,
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "Загрузка в R2 превысила %s сек — прервано.",
-                        CLOUD_UPLOAD_TIMEOUT_SECONDS,
-                    )
-                    await status.edit_text(
-                        msg(
-                            "ERROR_CLOUD_UPLOAD",
-                            size_mb=f"{actual_mb:.1f}",
-                            limit_mb=TELEGRAM_UPLOAD_LIMIT_MB,
-                        )
-                    )
-                    return  # work_dir удалится в finally
-                except RuntimeError as exc:
-                    logger.error("Загрузка в облако не удалась: %s", exc)
-                    await status.edit_text(
-                        msg(
-                            "ERROR_CLOUD_UPLOAD",
-                            size_mb=f"{actual_mb:.1f}",
-                            limit_mb=TELEGRAM_UPLOAD_LIMIT_MB,
-                        )
-                    )
-                    return  # work_dir удалится в finally
-
-                await status.edit_text(
-                    msg(
-                        "SUCCESS_CLOUD_LINK",
-                        size_mb=f"{actual_mb:.1f}",
-                        limit_mb=TELEGRAM_UPLOAD_LIMIT_MB,
-                        link=html.escape(link, quote=True),
-                        ttl_min=storage.R2_LINK_TTL_SECONDS // 60,
-                    ),
-                    disable_web_page_preview=True,
-                )
-                logger.info("Ссылка на облако отправлена пользователю %s", user.id)
-
-                # --- УБОРКА ОБЪЕКТА В ОБЛАКЕ ---
-                # Держать файл в R2 дольше нужного незачем: он занимает место
-                # и стоит денег. Ставим ФОНОВУЮ задачу: через 10 минут (пока
-                # пресайн-ссылка ещё жива) удаляем объект. Задача не блокирует
-                # ответ пользователю и не мешает другим запросам.
-                if object_key:
-                    asyncio.create_task(
-                        _delete_cloud_object_later(object_key)
-                    )
                 return  # work_dir удалится в finally
 
             # --- ШАГ 4: ОТПРАВКА (файл стримится с диска, не из RAM) ---
@@ -972,14 +835,23 @@ async def handle_link(message: Message) -> None:
             await status.delete()
             logger.info("Файл успешно отправлен пользователю %s", user.id)
 
+            # --- ШАГ 5: НЕМЕДЛЕННАЯ УБОРКА ФАЙЛА ---
+            # Файл уже улетел пользователю, на диске он больше не нужен.
+            # Удаляем СРАЗУ (не дожидаясь finally), чтобы на Render Free
+            # место освобождалось мгновенно. Ошибку удаления глушим —
+            # finally всё равно снесёт временную папку целиком.
+            try:
+                os.remove(downloaded)
+                logger.info("Временный файл удалён: %s", downloaded.name)
+            except OSError as exc:
+                logger.warning(
+                    "Не удалось удалить %s: %s (папку снесёт finally)",
+                    downloaded.name, exc,
+                )
+
     except TelegramEntityTooLarge:
         logger.warning("Telegram отклонил файл как слишком большой (%s)", url)
-        await status.edit_text(
-            msg(
-                "ERROR_TOO_LARGE_UNKNOWN",
-                limit_mb=TELEGRAM_UPLOAD_LIMIT_MB,
-            )
-        )
+        await status.edit_text(msg("ERROR_TOO_HEAVY"))
     except Exception as exc:
         # Любая ошибка -> понятное сообщение пользователю + лог для админа.
         logger.exception("Ошибка при обработке %s", url)
@@ -994,45 +866,6 @@ async def handle_link(message: Message) -> None:
         if work_dir is not None and work_dir.exists():
             shutil.rmtree(work_dir, ignore_errors=True)
             logger.info("Временная папка удалена: %s", work_dir.name)
-
-
-async def _delete_cloud_object_later(object_key: str) -> None:
-    """Фоновая задача: подождать и удалить объект из облака (R2).
-
-    Зачем: после отправки ссылки файл в R2 больше не нужен — он занимает
-    место и стоит денег. Удаляем его через CLOUD_FILE_TTL_SECONDS (10 минут
-    по умолчанию), пока пресайн-ссылка ещё действует.
-
-    Задача запускается через asyncio.create_task и НЕ блокирует ответ
-    пользователю. Все ошибки глушатся: падение уборки не должно влиять
-    на работу бота (объект в худшем случае подчистит lifecycle-правило R2).
-    """
-    try:
-        logger.info(
-            "Объект %s будет удалён из R2 через %s сек.",
-            object_key, CLOUD_FILE_TTL_SECONDS,
-        )
-        await asyncio.sleep(CLOUD_FILE_TTL_SECONDS)
-        removed = await asyncio.wait_for(
-            asyncio.to_thread(storage.delete_object, object_key),
-            timeout=CLOUD_UPLOAD_TIMEOUT_SECONDS,
-        )
-        if removed:
-            logger.info("Фоновая уборка: объект %s удалён из R2.", object_key)
-        else:
-            logger.warning(
-                "Фоновая уборка: объект %s удалить не удалось "
-                "(подчистит lifecycle-правило R2).", object_key,
-            )
-    except asyncio.CancelledError:
-        # Бота останавливают — не мешаем завершению процесса.
-        logger.info("Фоновая уборка объекта %s отменена при остановке.", object_key)
-        raise
-    except Exception as exc:
-        logger.warning(
-            "Фоновая уборка объекта %s не удалась: %s: %s",
-            object_key, type(exc).__name__, exc,
-        )
 
 
 # ============================================================
@@ -1120,26 +953,13 @@ async def main() -> None:
             "локально установите: sudo apt install ffmpeg"
         )
 
-    # Что делать с видео больше лимита Telegram: ссылкой в облако или отказ.
-    if storage.is_configured():
-        logger.info(
-            "Облако R2: %s (ссылки живут %d мин., объекты чистятся через %d мин.)",
-            storage.describe_config(),
-            storage.R2_LINK_TTL_SECONDS // 60,
-            CLOUD_FILE_TTL_SECONDS // 60,
-        )
-        logger.info(
-            "Потолок скачивания через облако: %.1f ГБ | таймаут залива: %d сек.",
-            CLOUD_MAX_DOWNLOAD_BYTES / (1024 ** 3),
-            CLOUD_UPLOAD_TIMEOUT_SECONDS,
-        )
-    else:
-        logger.warning(
-            "Облако R2 не настроено: видео больше %s МБ будут отклоняться. "
-            "Задайте R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, "
-            "R2_BUCKET (см. .env.example) — тогда они будут отдаваться ссылкой.",
-            TELEGRAM_UPLOAD_LIMIT_MB,
-        )
+    # Сообщаем, что схема работы — «только файлы в чат»: видео больше
+    # лимита Telegram отклоняются сразу, облака и ссылок нет.
+    logger.info(
+        "Режим: только файлы в чат (без ссылок). Формат: худшее/среднее "
+        "качество, чтобы уложиться в %s МБ.",
+        TELEGRAM_UPLOAD_LIMIT_MB,
+    )
 
     # Экземпляр бота (aiogram 3): ParseMode.HTML по умолчанию
     bot = Bot(
