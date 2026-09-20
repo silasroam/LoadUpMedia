@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: LoadUpMediaBot
     env: python
     region: oregon

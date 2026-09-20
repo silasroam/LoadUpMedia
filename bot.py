@@ -69,6 +69,12 @@ from typing import Any, Dict, Optional  # аннотации типов
 # ============================================================
 import yt_dlp             # скачивание видео с TikTok/Instagram/YouTube/Pinterest
 
+# Минимальный HTTP-сервер для Render Web Service (health-check по порту).
+# На бесплатном тарифе Render сервис типа «web» обязан слушать порт,
+# который Render выдаёт в переменной окружения PORT, иначе деплой
+# считается «не поднявшимся» (no open ports detected).
+from aiohttp import web
+
 # Тексты сообщений бота — единая точка правки копирайта
 from texts import PROGRESS_FRAMES, msg
 
@@ -153,9 +159,15 @@ def _register_js_runtime_paths() -> Optional[str]:
     project_dir = Path(__file__).resolve().parent
     # Кандидаты: папка проекта (.deno/bin), домашняя ~/.deno/bin и «ручной» путь.
     candidates = [
+        # Куда ставит deno наш buildCommand: <project>/.deno/bin
         project_dir / ".deno" / "bin",
+        # Куда ставит deno официальный установщик по умолчанию.
         Path.home() / ".deno" / "bin",
+        # Постоянный диск Render (на случай, если .deno выживает между
+        # деплоями: DENO_INSTALL=/opt/render/.deno).
         Path("/opt/render/.deno/bin"),
+        # Отдельно — путь, который Render иногда прописывает в env.
+        Path(os.environ.get("DENO_INSTALL", "/nonexistent"), "bin"),
     ]
     for directory in candidates:
         for exe in ("deno", "node"):
@@ -730,6 +742,41 @@ async def handle_link(message: Message) -> None:
 # ============================================================
 #  ТОЧКА ВХОДА
 # ============================================================
+
+# Порт, который Render отдаёт сервису через переменную окружения PORT.
+# Локально (без Render) используем 10000 — тот же дефолт, что и у Render.
+HEALTHCHECK_PORT = int(os.getenv("PORT", "10000"))
+
+
+async def handle_healthcheck(request: "web.Request") -> "web.Response":
+    """Простой health-check: любой GET отвечает 200 OK.
+
+    Нужен, чтобы Render видел открытый порт и не считал деплой упавшим
+    («no open ports detected»). Логику бота не трогает.
+    """
+    return web.Response(text="OK")
+
+
+async def start_healthcheck_server() -> "web.AppRunner":
+    """Поднимает минимальный HTTP-сервер на порту PORT.
+
+    Возвращает AppRunner — вызывающая сторона может позже корректно
+    закрыть сервер (runner.cleanup()).
+    """
+    app = web.Application()
+    app.router.add_get("/", handle_healthcheck)
+    app.router.add_get("/healthz", handle_healthcheck)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(runner, "0.0.0.0", HEALTHCHECK_PORT)
+    await site.start()
+
+    logger.info("Health-check сервер слушает 0.0.0.0:%d", HEALTHCHECK_PORT)
+    return runner
+
+
 async def main() -> None:
     """Инициализация бота и запуск polling."""
     # Проверяем, что пользователь вставил токен бота
@@ -783,10 +830,25 @@ async def main() -> None:
     # ВАЖНО: с одним токеном должен работать РОВНО ОДИН процесс, иначе
     # Telegram отдаёт TelegramConflictError (см. примечание в шапке файла).
     await bot.delete_webhook(drop_pending_updates=True)
+
+    # Поднимаем минимальный HTTP-сервер ДО polling: на бесплатном тарифе
+    # Render сервис типа «web» обязан слушать порт, иначе деплой падает
+    # с «no open ports detected». Если порт занят (например, запущен
+    # второй инстанс), бот продолжит работать — это не критично.
+    try:
+        healthcheck_runner = await start_healthcheck_server()
+    except OSError as exc:
+        healthcheck_runner = None
+        logger.warning("Не удалось поднять health-check сервер: %s", exc)
+
     logger.info("Бот запущен. Ожидание сообщений…")
     try:
         await dp.start_polling(bot)
     finally:
+        # Аккуратно гасим HTTP-сервер (если он был поднят).
+        if healthcheck_runner is not None:
+            await healthcheck_runner.cleanup()
+            logger.info("Health-check сервер остановлен.")
         # При остановке подчищаем временную папку целиком.
         shutil.rmtree(TEMP_ROOT_DIR, ignore_errors=True)
         logger.info("Бот остановлен, временные файлы очищены.")
